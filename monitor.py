@@ -35,6 +35,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6549327158")
 STATE_FILE = Path(os.environ.get("STATE_FILE", os.path.expanduser("~/kbo-monitor/state.json")))
 KST = timezone(timedelta(hours=9))
 
+KNOWN_PLATFORMS = ("ios", "watchos", "android", "wearos")
+
 QUERY = """\
 SELECT g.id AS game_id,
        g.away_team || ' @ ' || g.home_team AS matchup,
@@ -42,14 +44,17 @@ SELECT g.id AS game_id,
        g.away_score || ':' || g.home_score AS score,
        g.away_score::int AS away_score_n,
        g.home_score::int AS home_score_n,
-       COUNT(d.*) FILTER (WHERE d.platform='ios') AS ios_viewers,
-       COUNT(d.*) FILTER (WHERE d.platform='watchos') AS watch_viewers,
-       COUNT(d.*) FILTER (WHERE d.platform='ios' AND d.updated_at > NOW() - INTERVAL '15 minutes') AS active_ios_15min
+       COUNT(d.*) FILTER (WHERE d.platform='ios')     AS ios_viewers,
+       COUNT(d.*) FILTER (WHERE d.platform='watchos') AS ios_watch_viewers,
+       COUNT(d.*) FILTER (WHERE d.platform='android') AS android_viewers,
+       COUNT(d.*) FILTER (WHERE d.platform='wearos')  AS android_watch_viewers,
+       COUNT(d.*) FILTER (WHERE d.platform NOT IN ('ios','watchos','android','wearos')) AS other_viewers,
+       COUNT(d.*) AS total_viewers
 FROM public.games g
 LEFT JOIN public.device_tokens d ON d.game_id = g.id
 WHERE g.status = 'LIVE'
 GROUP BY g.id, g.home_team, g.away_team, g.inning, g.home_score, g.away_score
-ORDER BY ios_viewers DESC;\
+ORDER BY total_viewers DESC;\
 """
 
 # ── Supabase Query ──────────────────────────────────────────────
@@ -71,8 +76,18 @@ def query_supabase() -> list[dict]:
             else:
                 raise
         data = json.loads(resp.read())
+        int_cols = (
+            "ios_viewers",
+            "ios_watch_viewers",
+            "android_viewers",
+            "android_watch_viewers",
+            "other_viewers",
+            "total_viewers",
+            "away_score_n",
+            "home_score_n",
+        )
         for row in data:
-            for k in ("ios_viewers", "watch_viewers", "active_ios_15min", "away_score_n", "home_score_n"):
+            for k in int_cols:
                 row[k] = int(row.get(k, 0) or 0)
         return data
     except (URLError, json.JSONDecodeError, KeyError) as e:
@@ -95,6 +110,18 @@ def save_state(state: dict):
 
 # ── Message Formatting ──────────────────────────────────────────
 
+def _platform_breakdown_line(curr_games: list[dict]) -> str:
+    ios = sum(g["ios_viewers"] for g in curr_games)
+    iosw = sum(g["ios_watch_viewers"] for g in curr_games)
+    aos = sum(g["android_viewers"] for g in curr_games)
+    aosw = sum(g["android_watch_viewers"] for g in curr_games)
+    other = sum(g["other_viewers"] for g in curr_games)
+    parts = [f"📱iOS {ios}", f"⌚iOS {iosw}", f"📱AOS {aos}", f"⌚AOS {aosw}"]
+    if other:
+        parts.append(f"❓기타 {other}")
+    return " · ".join(parts)
+
+
 def format_live_message(prev_games: dict, curr_games: list[dict], tick: int, start_iso: str, started: bool) -> str:
     start_time = datetime.fromisoformat(start_iso)
     elapsed_min = int((datetime.now(KST) - start_time).total_seconds() / 60)
@@ -102,8 +129,8 @@ def format_live_message(prev_games: dict, curr_games: list[dict], tick: int, sta
     curr_ids = set(str(g["game_id"]) for g in curr_games)
     prev_ids = set(prev_games.keys())
 
-    total_now = sum(g["ios_viewers"] for g in curr_games)
-    total_prev = sum(g["ios_viewers"] for g in prev_games.values())
+    total_now = sum(g["total_viewers"] for g in curr_games)
+    total_prev = sum(g["total_viewers"] for g in prev_games.values())
     diff_total = total_now - total_prev
     diff_str = f"+{diff_total}" if diff_total >= 0 else str(diff_total)
 
@@ -113,6 +140,7 @@ def format_live_message(prev_games: dict, curr_games: list[dict], tick: int, sta
     else:
         lines = [f"⚾ KBO LIVE (Tick {tick} · +{elapsed_min}분)"]
     lines.append(f"👥 총 관람자 {total_now}명 (직전 대비 {diff_str})")
+    lines.append(_platform_breakdown_line(curr_games))
     lines.append("")
 
     # Ended games
@@ -120,7 +148,7 @@ def format_live_message(prev_games: dict, curr_games: list[dict], tick: int, sta
     for gid in ended_ids:
         g = prev_games[gid]
         away, home = g["matchup"].split(" @ ")
-        lines.append(f"🏁 {away} vs {home} · {g.get('inning','')} · {g['score']} · 종료 (-{g['ios_viewers']}명)")
+        lines.append(f"🏁 {away} vs {home} · {g.get('inning','')} · {g['score']} · 종료 (-{g['total_viewers']}명)")
     if ended_ids:
         lines.append("")
 
@@ -136,11 +164,11 @@ def format_live_message(prev_games: dict, curr_games: list[dict], tick: int, sta
     # Game list
     for g in curr_games:
         gid = str(g["game_id"])
-        prev_v = prev_games.get(gid, {}).get("ios_viewers", 0)
-        d = g["ios_viewers"] - prev_v
+        prev_v = prev_games.get(gid, {}).get("total_viewers", 0)
+        d = g["total_viewers"] - prev_v
         d_str = f"＋{d}" if d > 0 else str(d)
         away, home = g["matchup"].split(" @ ")
-        lines.append(f"• {away} vs {home} · {g['inning']} · {g['score']} · {g['ios_viewers']}명 ({d_str})")
+        lines.append(f"• {away} vs {home} · {g['inning']} · {g['score']} · {g['total_viewers']}명 ({d_str})")
 
     # Summary
     obs = build_observations(prev_games, curr_games, diff_total, ended_ids)
@@ -154,7 +182,7 @@ def format_live_message(prev_games: dict, curr_games: list[dict], tick: int, sta
 def format_ended_message(prev_games: dict, start_iso: str, tick: int, peak: int) -> str:
     start_time = datetime.fromisoformat(start_iso)
     elapsed_min = int((datetime.now(KST) - start_time).total_seconds() / 60)
-    total = sum(g["ios_viewers"] for g in prev_games.values())
+    total = sum(g["total_viewers"] for g in prev_games.values())
 
     lines = [
         f"⚾ KBO LIVE 종료 (Tick {tick} · +{elapsed_min}분)",
@@ -162,9 +190,10 @@ def format_ended_message(prev_games: dict, start_iso: str, tick: int, peak: int)
     ]
     for g in prev_games.values():
         away, home = g["matchup"].split(" @ ")
-        lines.append(f"🏁 {away} vs {home} · {g.get('inning','')} · {g['score']} · {g['ios_viewers']}명")
+        lines.append(f"🏁 {away} vs {home} · {g.get('inning','')} · {g['score']} · {g['total_viewers']}명")
 
     lines.append("")
+    lines.append(_platform_breakdown_line(list(prev_games.values())))
     lines.append(f"📌 최종: 동시 시청 {total}명 · 피크 {peak}명")
     return "\n".join(lines)
 
@@ -190,8 +219,8 @@ def build_observations(prev_games: dict, curr_games: list[dict], diff_total: int
     movers = []
     for g in curr_games:
         gid = str(g["game_id"])
-        prev_v = prev_games.get(gid, {}).get("ios_viewers", 0)
-        d = g["ios_viewers"] - prev_v
+        prev_v = prev_games.get(gid, {}).get("total_viewers", 0)
+        d = g["total_viewers"] - prev_v
         if abs(d) >= 3:
             movers.append((g["matchup"], d))
     for name, d in movers:
@@ -246,7 +275,7 @@ def main():
     # ── Games are live → always report ──
     if is_live:
         state["tick"] = state.get("tick", 0) + 1
-        total = sum(g["ios_viewers"] for g in games)
+        total = sum(g["total_viewers"] for g in games)
         state["peak_viewers"] = max(state.get("peak_viewers", 0), total)
 
         msg = format_live_message(prev_games, games, state["tick"], state["start_time"], started)
