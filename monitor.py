@@ -38,20 +38,31 @@ KST = timezone(timedelta(hours=9))
 KNOWN_PLATFORMS = ("ios", "watchos", "android", "wearos")
 
 QUERY = """\
+WITH active_sessions AS (
+    SELECT *
+    FROM public.live_view_sessions
+    WHERE active = true
+      AND updated_at >= now() - interval '12 hours'
+)
 SELECT g.id AS game_id,
        g.away_team || ' @ ' || g.home_team AS matchup,
        g.inning,
        g.away_score || ':' || g.home_score AS score,
        g.away_score::int AS away_score_n,
        g.home_score::int AS home_score_n,
-       COUNT(d.*) FILTER (WHERE d.platform='ios')     AS ios_viewers,
-       COUNT(d.*) FILTER (WHERE d.platform='watchos') AS ios_watch_viewers,
-       COUNT(d.*) FILTER (WHERE d.platform='android') AS android_viewers,
-       COUNT(d.*) FILTER (WHERE d.platform='wearos')  AS android_watch_viewers,
-       COUNT(d.*) FILTER (WHERE d.platform NOT IN ('ios','watchos','android','wearos')) AS other_viewers,
-       COUNT(d.*) AS total_viewers
+       COUNT(s.*) FILTER (WHERE s.surface='ios')     AS ios_viewers,
+       COUNT(s.*) FILTER (WHERE s.surface='watchos') AS ios_watch_viewers,
+       COUNT(s.*) FILTER (WHERE s.surface='android') AS android_viewers,
+       COUNT(s.*) FILTER (WHERE s.surface='wearos')  AS android_watch_viewers,
+       COUNT(s.*) FILTER (WHERE s.surface NOT IN ('ios','watchos','android','wearos')) AS other_viewers,
+       COUNT(s.*) AS total_viewers,
+       COUNT(DISTINCT s.user_key) FILTER (WHERE s.surface='ios')     AS ios_people,
+       COUNT(DISTINCT s.user_key) FILTER (WHERE s.surface='watchos') AS ios_watch_people,
+       COUNT(DISTINCT s.user_key) FILTER (WHERE s.surface='android') AS android_people,
+       COUNT(DISTINCT s.user_key) FILTER (WHERE s.surface='wearos')  AS android_watch_people,
+       COUNT(DISTINCT s.user_key) AS total_people
 FROM public.games g
-LEFT JOIN public.device_tokens d ON d.game_id = g.id
+LEFT JOIN active_sessions s ON s.game_id = g.id
 WHERE g.status = 'LIVE'
 GROUP BY g.id, g.home_team, g.away_team, g.inning, g.home_score, g.away_score
 ORDER BY total_viewers DESC;\
@@ -83,6 +94,11 @@ def query_supabase() -> list[dict]:
             "android_watch_viewers",
             "other_viewers",
             "total_viewers",
+            "ios_people",
+            "ios_watch_people",
+            "android_people",
+            "android_watch_people",
+            "total_people",
             "away_score_n",
             "home_score_n",
         )
@@ -122,6 +138,15 @@ def _platform_breakdown_line(curr_games: list[dict]) -> str:
     return " · ".join(parts)
 
 
+def _people_breakdown_line(curr_games: list[dict]) -> str:
+    total = sum(g["total_people"] for g in curr_games)
+    ios = sum(g["ios_people"] for g in curr_games)
+    iosw = sum(g["ios_watch_people"] for g in curr_games)
+    aos = sum(g["android_people"] for g in curr_games)
+    aosw = sum(g["android_watch_people"] for g in curr_games)
+    return f"🧍사람 {total}명 · iOS {ios} · watchOS {iosw} · Android {aos} · Wear OS {aosw}"
+
+
 def format_live_message(prev_games: dict, curr_games: list[dict], tick: int, start_iso: str, started: bool) -> str:
     start_time = datetime.fromisoformat(start_iso)
     elapsed_min = int((datetime.now(KST) - start_time).total_seconds() / 60)
@@ -139,8 +164,9 @@ def format_live_message(prev_games: dict, curr_games: list[dict], tick: int, sta
         lines = [f"⚾ KBO LIVE (Tick {tick})"]
     else:
         lines = [f"⚾ KBO LIVE (Tick {tick} · +{elapsed_min}분)"]
-    lines.append(f"👥 총 관람자 {total_now}명 (직전 대비 {diff_str})")
+    lines.append(f"👥 활성 surface {total_now}개 (직전 대비 {diff_str})")
     lines.append(_platform_breakdown_line(curr_games))
+    lines.append(_people_breakdown_line(curr_games))
     lines.append("")
 
     # Ended games
@@ -148,7 +174,7 @@ def format_live_message(prev_games: dict, curr_games: list[dict], tick: int, sta
     for gid in ended_ids:
         g = prev_games[gid]
         away, home = g["matchup"].split(" @ ")
-        lines.append(f"🏁 {away} vs {home} · {g.get('inning','')} · {g['score']} · 종료 (-{g['total_viewers']}명)")
+        lines.append(f"🏁 {away} vs {home} · {g.get('inning','')} · {g['score']} · 종료 (-{g['total_viewers']}개)")
     if ended_ids:
         lines.append("")
 
@@ -168,7 +194,10 @@ def format_live_message(prev_games: dict, curr_games: list[dict], tick: int, sta
         d = g["total_viewers"] - prev_v
         d_str = f"＋{d}" if d > 0 else str(d)
         away, home = g["matchup"].split(" @ ")
-        lines.append(f"• {away} vs {home} · {g['inning']} · {g['score']} · {g['total_viewers']}명 ({d_str})")
+        lines.append(
+            f"• {away} vs {home} · {g['inning']} · {g['score']} · "
+            f"활성 {g['total_viewers']} / 사람 {g['total_people']}명 ({d_str})"
+        )
 
     # Summary
     obs = build_observations(prev_games, curr_games, diff_total, ended_ids)
@@ -190,11 +219,15 @@ def format_ended_message(prev_games: dict, start_iso: str, tick: int, peak: int)
     ]
     for g in prev_games.values():
         away, home = g["matchup"].split(" @ ")
-        lines.append(f"🏁 {away} vs {home} · {g.get('inning','')} · {g['score']} · {g['total_viewers']}명")
+        lines.append(
+            f"🏁 {away} vs {home} · {g.get('inning','')} · {g['score']} · "
+            f"활성 {g['total_viewers']} / 사람 {g['total_people']}명"
+        )
 
     lines.append("")
     lines.append(_platform_breakdown_line(list(prev_games.values())))
-    lines.append(f"📌 최종: 동시 시청 {total}명 · 피크 {peak}명")
+    lines.append(_people_breakdown_line(list(prev_games.values())))
+    lines.append(f"📌 최종: 활성 surface {total} · 피크 {peak}")
     return "\n".join(lines)
 
 
