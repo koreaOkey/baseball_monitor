@@ -132,19 +132,14 @@ def _platform_breakdown_line(curr_games: list[dict]) -> str:
     aos = sum(g["android_viewers"] for g in curr_games)
     aosw = sum(g["android_watch_viewers"] for g in curr_games)
     other = sum(g["other_viewers"] for g in curr_games)
-    parts = [f"📱iOS {ios}", f"⌚iOS {iosw}", f"📱AOS {aos}", f"⌚AOS {aosw}"]
+    parts = [f"📱 iOS {ios}", f"Android {aos}", f"⌚ watchOS {iosw}", f"Wear OS {aosw}"]
     if other:
         parts.append(f"❓기타 {other}")
     return " · ".join(parts)
 
 
-def _people_breakdown_line(curr_games: list[dict]) -> str:
-    total = sum(g["total_people"] for g in curr_games)
-    ios = sum(g["ios_people"] for g in curr_games)
-    iosw = sum(g["ios_watch_people"] for g in curr_games)
-    aos = sum(g["android_people"] for g in curr_games)
-    aosw = sum(g["android_watch_people"] for g in curr_games)
-    return f"🧍사람 {total}명 · iOS {ios} · watchOS {iosw} · Android {aos} · Wear OS {aosw}"
+def _total_people(curr_games: list[dict]) -> int:
+    return sum(g["total_people"] for g in curr_games)
 
 
 def format_live_message(prev_games: dict, curr_games: list[dict], tick: int, start_iso: str, started: bool) -> str:
@@ -155,6 +150,7 @@ def format_live_message(prev_games: dict, curr_games: list[dict], tick: int, sta
     prev_ids = set(prev_games.keys())
 
     total_now = sum(g["total_viewers"] for g in curr_games)
+    total_people = _total_people(curr_games)
     total_prev = sum(g["total_viewers"] for g in prev_games.values())
     diff_total = total_now - total_prev
     diff_str = f"+{diff_total}" if diff_total >= 0 else str(diff_total)
@@ -164,9 +160,8 @@ def format_live_message(prev_games: dict, curr_games: list[dict], tick: int, sta
         lines = [f"⚾ KBO LIVE (Tick {tick})"]
     else:
         lines = [f"⚾ KBO LIVE (Tick {tick} · +{elapsed_min}분)"]
-    lines.append(f"👥 활성 surface {total_now}개 (직전 대비 {diff_str})")
+    lines.append(f"👥 활성 {total_now}개 · 고유 사용자 {total_people}명 (직전 대비 {diff_str})")
     lines.append(_platform_breakdown_line(curr_games))
-    lines.append(_people_breakdown_line(curr_games))
     lines.append("")
 
     # Ended games
@@ -212,6 +207,7 @@ def format_ended_message(prev_games: dict, start_iso: str, tick: int, peak: int)
     start_time = datetime.fromisoformat(start_iso)
     elapsed_min = int((datetime.now(KST) - start_time).total_seconds() / 60)
     total = sum(g["total_viewers"] for g in prev_games.values())
+    total_people = _total_people(list(prev_games.values()))
 
     lines = [
         f"⚾ KBO LIVE 종료 (Tick {tick} · +{elapsed_min}분)",
@@ -226,8 +222,7 @@ def format_ended_message(prev_games: dict, start_iso: str, tick: int, peak: int)
 
     lines.append("")
     lines.append(_platform_breakdown_line(list(prev_games.values())))
-    lines.append(_people_breakdown_line(list(prev_games.values())))
-    lines.append(f"📌 최종: 활성 surface {total} · 피크 {peak}")
+    lines.append(f"📌 최종: 활성 {total}개 · 고유 사용자 {total_people}명 · 피크 {peak}")
     return "\n".join(lines)
 
 
